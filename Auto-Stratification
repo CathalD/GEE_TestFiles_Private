@@ -275,8 +275,8 @@ var Stratifier = {
    * Create strata using Copernicus land cover
    */
   createCopernicusStrata: function(aoi) {
-    var strata = landcover.remap(COPERNICUS_STRATA.from, COPERNICUS_STRATA.to).rename('strata');
-    var mask = strata.neq(10); // Exclude water
+    var strata = landcover.remap(COPERNICUS_STRATA.from, COPERNICUS_STRATA.to, 10).rename('strata');
+    var mask = strata.neq(10); // Exclude water/undefined
     return strata.updateMask(mask).clip(aoi);
   },
   
@@ -284,63 +284,121 @@ var Stratifier = {
    * Create strata using Google Satellite Embeddings with auto-optimization
    */
   createEmbeddingsStrata: function(aoi, callback) {
-    // Load Google Satellite Embeddings
-    var embeddings = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL")
+    // Use Sentinel-2 (Harmonized) for consistent optical data
+    var img = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
       .filterBounds(aoi)
-      .filterDate('2020-01-01', '2024-01-01')
-      .sort('system:time_start', false)
-      .first()
-      .clip(aoi);
-    
-    // Sample embeddings for training
-    var trainingSample = embeddings.sample({
+      .filterDate('2023-06-01', '2023-09-30')
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+      .median()
+      .clip(aoi)
+      .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12']);
+
+    var trainingSample = img.sample({
       region: aoi,
-      scale: CONFIG.EMBEDDINGS_SCALE,
+      scale: 100,
       numPixels: CONFIG.TRAINING_PIXELS,
       seed: CONFIG.RANDOM_SEED,
       geometries: true
     });
-    
-    // Run unsupervised classification with auto-optimization
+
     var clusterer = ee.Clusterer.wekaCascadeKMeans({
       minClusters: CONFIG.MIN_CLUSTERS,
       maxClusters: CONFIG.MAX_CLUSTERS,
       restarts: CONFIG.CLUSTER_RESTARTS,
       distanceFunction: 'Euclidean'
     }).train(trainingSample);
-    
-    // Apply clusterer
-    var classified = embeddings.cluster(clusterer).rename('strata');
-    
-    // Get number of clusters found
-    var clusterCount = classified.reduceRegion({
-      reducer: ee.Reducer.countDistinct(),
+
+    var rawClassified = img.cluster(clusterer);
+
+    // Remap arbitrary cluster IDs to sequential integers (0, 1, 2...)
+    var hist = rawClassified.reduceRegion({
+      reducer: ee.Reducer.frequencyHistogram(),
       geometry: aoi,
-      scale: CONFIG.EMBEDDINGS_SCALE * 10, // Faster at coarser scale
-      maxPixels: CONFIG.MAX_PIXELS
+      scale: 100,
+      maxPixels: 1e13,
+      tileScale: 4
     });
     
-    clusterCount.evaluate(function(result, error) {
-      if (error) {
-        callback(null, null, error);
-        return;
-      }
+    hist.evaluate(function(result, error) {
+      if (error) { callback(null, null, error); return; }
       
-      var numClusters = result.strata;
+      var clusterCounts = result.cluster; // Default band name is 'cluster'
+      if (!clusterCounts) { callback(null, null, 'No valid data found.'); return; }
       
-      // Reproject to match analysis scale
-      var strataResampled = classified.reproject({
+      var originalIds = Object.keys(clusterCounts).map(Number).sort(function(a, b){return a-b});
+      var count = originalIds.length;
+      var newIds = [];
+      for (var i = 0; i < count; i++) newIds.push(i);
+      
+      var remapped = rawClassified.remap(originalIds, newIds).rename('strata');
+      
+      var strataResampled = remapped.reproject({
         crs: 'EPSG:4326',
         scale: CONFIG.ANALYSIS_SCALE
       });
       
-      callback(strataResampled.clip(aoi), numClusters, null);
+      callback(strataResampled.clip(aoi), count, null);
     });
   },
   
   /**
-   * Generate dynamic palette for clusters
+   * [NEW] Compare clusters to Copernicus Land Cover to suggest labels
    */
+  analyzeClusterComposition: function(aoi, strataImage, callback) {
+    // 1. Prepare Simplified Landcover to match our known classes
+    var simplified = landcover.remap(COPERNICUS_STRATA.from, COPERNICUS_STRATA.to, 10)
+      .rename('landcover_class');
+      
+    // 2. Combine with Clusters
+    var combined = strataImage.addBands(simplified);
+    
+    // 3. Count overlap: Group by Cluster, count Landcover types
+    var stats = combined.reduceRegion({
+      reducer: ee.Reducer.frequencyHistogram().group({
+        groupField: 0, // Group by 'strata' (band 0)
+        groupName: 'cluster_id',
+      }),
+      geometry: aoi,
+      scale: CONFIG.ANALYSIS_SCALE, 
+      maxPixels: 1e13,
+      tileScale: 4
+    });
+    
+    stats.evaluate(function(result, error) {
+      if (error) { callback(null, error); return; }
+      
+      var suggestions = {}; // Map ClusterID -> "Likely Forest"
+      var groups = result.groups;
+      
+      if (groups) {
+        groups.forEach(function(g) {
+          var clusterId = g.cluster_id;
+          var histogram = g.histogram;
+          
+          // Find dominant class
+          var dominantClass = null;
+          var maxCount = -1;
+          for (var lcClass in histogram) {
+             var count = histogram[lcClass];
+             if (count > maxCount) {
+               maxCount = count;
+               dominantClass = parseInt(lcClass);
+             }
+          }
+          
+          // Map Class ID to Name using the Config
+          var nameIndex = COPERNICUS_STRATA.codes.indexOf(dominantClass);
+          var label = "Unknown";
+          if (nameIndex !== -1 && COPERNICUS_STRATA.names[nameIndex]) {
+            label = COPERNICUS_STRATA.names[nameIndex];
+          }
+          suggestions[clusterId] = label;
+        });
+      }
+      callback(suggestions, null);
+    });
+  },
+  
   generateClusterPalette: function(numClusters) {
     var baseColors = [
       '#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00',
@@ -349,18 +407,18 @@ var Stratifier = {
     return baseColors.slice(0, numClusters);
   },
   
-  /**
-   * Generate cluster names
-   */
-  generateClusterNames: function(numClusters) {
+  generateClusterNames: function(numClusters, suggestions) {
     var names = [];
     for (var i = 0; i < numClusters; i++) {
-      names.push('Cluster ' + (i + 1));
+      var name = 'Cluster ' + (i + 1);
+      if (suggestions && suggestions[i]) {
+        name += ' (' + suggestions[i] + '?)';
+      }
+      names.push(name);
     }
     return names;
   }
 };
-
 // =================================================================================
 // === 6. USER INTERFACE ===========================================================
 // =================================================================================
@@ -587,23 +645,31 @@ function runAnalysis() {
     resultsPanel.add(ui.Label('Running AI-based stratification...', {color: '#666', fontStyle: 'italic'}));
     
     Stratifier.createEmbeddingsStrata(AppState.currentAoi, function(strataImage, numClusters, error) {
+      
       if (error) {
         resultsPanel.clear();
         resultsPanel.add(ui.Label('⚠️ Error in clustering: ' + error, STYLES.ERROR));
         return;
       }
+      
       AppState.strataImage = strataImage;
       AppState.numClusters = numClusters;
-      // Pass the clusters to the strict calculation
-      calculateStrictMethodI(carbonType, confVal.value, moeVal.value, numClusters);
+      
+      // [NEW] Analyze what these clusters represent
+      resultsPanel.add(ui.Label('Analyzing cluster composition...', {color: '#666', fontStyle: 'italic'}));
+      
+      Stratifier.analyzeClusterComposition(AppState.currentAoi, strataImage, function(suggestions, err) {
+         // Proceed even if suggestion fails, just pass null
+         calculateStrictMethodI(carbonType, confVal.value, moeVal.value, numClusters, suggestions);
+      });
     });
   } else {
     AppState.strataImage = Stratifier.createCopernicusStrata(AppState.currentAoi);
     AppState.numClusters = COPERNICUS_STRATA.codes.length;
-    calculateStrictMethodI(carbonType, confVal.value, moeVal.value, null);
+    // Pass null for suggestions as we already know the classes
+    calculateStrictMethodI(carbonType, confVal.value, moeVal.value, null, null);
   }
 }
-
 /**
  * STRICT UNFCCC METHOD I IMPLEMENTATION (Equation 5)
  * 
@@ -623,7 +689,7 @@ function runAnalysis() {
  *   E = Q × p (allowable error based on weighted mean)
  *   z = z-score for confidence level
  */
-function calculateStrictMethodI(carbonType, confidence, marginOfErrorPercent, numClusters) {
+function calculateStrictMethodI(carbonType, confidence, marginOfErrorPercent, numClusters, clusterSuggestions) {
   var carbonImage = carbonType === 'forest' ? forestCarbon : soilCarbon;
   var plotSizeHa = carbonType === 'forest' ? CONFIG.FOREST_PLOT_SIZE_HA : CONFIG.SOIL_PLOT_SIZE_HA;
   
@@ -772,11 +838,11 @@ function calculateStrictMethodI(carbonType, confidence, marginOfErrorPercent, nu
       STYLES.INFO
     ));
 
-    // Display allocation plan
-    displayAllocationPlan(AppState.allocationInfo, final_n, numClusters);
+   // Display allocation plan
+    displayAllocationPlan(AppState.allocationInfo, final_n, numClusters, clusterSuggestions);
     
     // Create legend
-    createLegend(numClusters);
+    createLegend(numClusters, clusterSuggestions);
     
     // Add Strata Layer to map
     var palette = numClusters ? 
@@ -822,7 +888,7 @@ function calculateStrictMethodI(carbonType, confidence, marginOfErrorPercent, nu
   });
 }
 
-function displayAllocationPlan(plan, totalSize, numClusters) {
+function displayAllocationPlan(plan, totalSize, numClusters, suggestions) {
   resultsPanel.add(ui.Label(''));
   resultsPanel.add(ui.Label('Stratum Allocation (Neyman Optimal)', STYLES.SUBHEADER));
   
@@ -848,8 +914,8 @@ function displayAllocationPlan(plan, totalSize, numClusters) {
   AppState.stratumCheckboxes = [];
   plan.sort(function(a, b) { return a.strata_code - b.strata_code; });
   
-  var names = numClusters ? 
-    Stratifier.generateClusterNames(numClusters) : 
+var names = numClusters ?
+    Stratifier.generateClusterNames(numClusters, suggestions) : // Pass suggestions here
     COPERNICUS_STRATA.names;
   
   plan.forEach(function(s, index) {
@@ -954,15 +1020,17 @@ function generateStratifiedPoints() {
   });
 }
 
-function createLegend(numClusters) {
+function createLegend(numClusters, suggestions) {
   legendPanel.clear();
   
-  var codes = numClusters ? 
+  var codes = numClusters ?
     Array.from({length: numClusters}, function(_, i) { return i; }) : 
     COPERNICUS_STRATA.codes;
-  var names = numClusters ? 
-    Stratifier.generateClusterNames(numClusters) : 
+    
+  var names = numClusters ?
+    Stratifier.generateClusterNames(numClusters, suggestions) : // Pass suggestions here
     COPERNICUS_STRATA.names;
+    
   var palette = numClusters ? 
     Stratifier.generateClusterPalette(numClusters) : 
     COPERNICUS_STRATA.palette;
