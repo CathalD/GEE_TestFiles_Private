@@ -284,23 +284,23 @@ var Stratifier = {
    * Create strata using Google Satellite Embeddings with auto-optimization
    */
   createEmbeddingsStrata: function(aoi, callback) {
-    // Use Sentinel-2 (Harmonized) for consistent optical data
-    var img = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    // [FIX] Use Google Embeddings with Mosaic
+    var embeddings = ee.ImageCollection("GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL")
       .filterBounds(aoi)
-      .filterDate('2023-06-01', '2023-09-30')
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-      .median()
-      .clip(aoi)
-      .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12']);
+      .filterDate('2023-01-01', '2024-01-01') // Use a specific year
+      .mosaic() // [CRITICAL] Stitches tiles together
+      .clip(aoi);
 
-    var trainingSample = img.sample({
+    // Sample pixels for training
+    var trainingSample = embeddings.sample({
       region: aoi,
-      scale: 100,
+      scale: CONFIG.EMBEDDINGS_SCALE,
       numPixels: CONFIG.TRAINING_PIXELS,
       seed: CONFIG.RANDOM_SEED,
       geometries: true
     });
 
+    // Run unsupervised classification with auto-optimization
     var clusterer = ee.Clusterer.wekaCascadeKMeans({
       minClusters: CONFIG.MIN_CLUSTERS,
       maxClusters: CONFIG.MAX_CLUSTERS,
@@ -308,23 +308,32 @@ var Stratifier = {
       distanceFunction: 'Euclidean'
     }).train(trainingSample);
 
-    var rawClassified = img.cluster(clusterer);
+    // Apply clusterer
+    var rawClassified = embeddings.cluster(clusterer);
 
-    // Remap arbitrary cluster IDs to sequential integers (0, 1, 2...)
+    // [FIX] Remap Cluster IDs to sequential integers (0, 1, 2...)
     var hist = rawClassified.reduceRegion({
       reducer: ee.Reducer.frequencyHistogram(),
       geometry: aoi,
-      scale: 100,
-      maxPixels: 1e13,
+      scale: CONFIG.EMBEDDINGS_SCALE * 5, // Coarser scale for speed
+      maxPixels: CONFIG.MAX_PIXELS,
       tileScale: 4
     });
     
     hist.evaluate(function(result, error) {
-      if (error) { callback(null, null, error); return; }
+      if (error) {
+        callback(null, null, error);
+        return;
+      }
       
-      var clusterCounts = result.cluster; // Default band name is 'cluster'
-      if (!clusterCounts) { callback(null, null, 'No valid data found.'); return; }
+      var clusterCounts = result.cluster; 
       
+      if (!clusterCounts) {
+        callback(null, null, 'No valid data found in AOI for clustering.');
+        return;
+      }
+      
+      // Get the actual IDs found and map them to 0, 1, 2...
       var originalIds = Object.keys(clusterCounts).map(Number).sort(function(a, b){return a-b});
       var count = originalIds.length;
       var newIds = [];
@@ -332,6 +341,7 @@ var Stratifier = {
       
       var remapped = rawClassified.remap(originalIds, newIds).rename('strata');
       
+      // Reproject to analysis scale to match carbon data
       var strataResampled = remapped.reproject({
         crs: 'EPSG:4326',
         scale: CONFIG.ANALYSIS_SCALE
@@ -345,17 +355,17 @@ var Stratifier = {
    * [NEW] Compare clusters to Copernicus Land Cover to suggest labels
    */
   analyzeClusterComposition: function(aoi, strataImage, callback) {
-    // 1. Prepare Simplified Landcover to match our known classes
+    // 1. Prepare Simplified Landcover
     var simplified = landcover.remap(COPERNICUS_STRATA.from, COPERNICUS_STRATA.to, 10)
       .rename('landcover_class');
       
     // 2. Combine with Clusters
     var combined = strataImage.addBands(simplified);
     
-    // 3. Count overlap: Group by Cluster, count Landcover types
+    // 3. Count overlap
     var stats = combined.reduceRegion({
       reducer: ee.Reducer.frequencyHistogram().group({
-        groupField: 0, // Group by 'strata' (band 0)
+        groupField: 0, // Group by 'strata'
         groupName: 'cluster_id',
       }),
       geometry: aoi,
@@ -367,7 +377,7 @@ var Stratifier = {
     stats.evaluate(function(result, error) {
       if (error) { callback(null, error); return; }
       
-      var suggestions = {}; // Map ClusterID -> "Likely Forest"
+      var suggestions = {}; 
       var groups = result.groups;
       
       if (groups) {
@@ -386,7 +396,7 @@ var Stratifier = {
              }
           }
           
-          // Map Class ID to Name using the Config
+          // Map Class ID to Name
           var nameIndex = COPERNICUS_STRATA.codes.indexOf(dominantClass);
           var label = "Unknown";
           if (nameIndex !== -1 && COPERNICUS_STRATA.names[nameIndex]) {
@@ -640,12 +650,11 @@ function runAnalysis() {
   var stratMethod = stratMethodSelect.getValue();
   AppState.stratificationMethod = stratMethod;
   
-  if (stratMethod.indexOf('Google') !== -1) {
+if (stratMethod.indexOf('Google') !== -1) {
     resultsPanel.clear();
     resultsPanel.add(ui.Label('Running AI-based stratification...', {color: '#666', fontStyle: 'italic'}));
     
     Stratifier.createEmbeddingsStrata(AppState.currentAoi, function(strataImage, numClusters, error) {
-      
       if (error) {
         resultsPanel.clear();
         resultsPanel.add(ui.Label('⚠️ Error in clustering: ' + error, STYLES.ERROR));
@@ -655,19 +664,14 @@ function runAnalysis() {
       AppState.strataImage = strataImage;
       AppState.numClusters = numClusters;
       
-      // [NEW] Analyze what these clusters represent
+      // Analyze composition
       resultsPanel.add(ui.Label('Analyzing cluster composition...', {color: '#666', fontStyle: 'italic'}));
       
       Stratifier.analyzeClusterComposition(AppState.currentAoi, strataImage, function(suggestions, err) {
-         // Proceed even if suggestion fails, just pass null
+         // Proceed with calculation
          calculateStrictMethodI(carbonType, confVal.value, moeVal.value, numClusters, suggestions);
       });
     });
-  } else {
-    AppState.strataImage = Stratifier.createCopernicusStrata(AppState.currentAoi);
-    AppState.numClusters = COPERNICUS_STRATA.codes.length;
-    // Pass null for suggestions as we already know the classes
-    calculateStrictMethodI(carbonType, confVal.value, moeVal.value, null, null);
   }
 }
 /**
