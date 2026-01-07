@@ -1,0 +1,836 @@
+// =================================================================================
+// === RANDOM SAMPLING  =========================
+// === Version 3.3 -  ===========================
+// =================================================================================
+
+// =================================================================================
+// === 1. CONFIGURATION ============================================================
+// =================================================================================
+
+var CONFIG = {
+  ANALYSIS_SCALE: 250,
+  MAX_PIXELS: 1e10,
+  MAX_ERROR: 1,
+  DEFAULT_CONFIDENCE: 90,
+  DEFAULT_MARGIN_OF_ERROR: 20,
+  RANDOM_SEED: 42,
+  
+  // Plot sizes per UNFCCC AR-AM-Tool-03 methodology
+  // N = Area / Plot Size (Equation 1)
+  FOREST_PLOT_SIZE_HA: 0.04,  // 400 m² = 0.04 ha
+  SOIL_PLOT_SIZE_HA: 0.0025,    // 100 m² = 0.01 ha
+  
+  // Bayesian blending parameters
+  // Reference area where measured values get 50% weight
+  A_REF: 200000,  // 200,000 ha
+  
+  // Canada-wide default statistics (prior values)
+  // Used for Bayesian shrinkage estimation
+  DEFAULTS: {
+    forest: {
+      mean: 4.14,    // t C/ha
+      stdDev: 1.8    // t C/ha
+    },
+    soil: {
+      mean: 13.2,    // t C/ha
+      stdDev: 10.0   // t C/ha
+    }
+  }
+};
+
+var STYLES = {
+  TITLE: {fontSize: '28px', fontWeight: 'bold', color: '#005931'},
+  SUBTITLE: {fontSize: '18px', fontWeight: '500', color: '#333333'},
+  PARAGRAPH: {fontSize: '14px', color: '#555555'},
+  HEADER: {fontSize: '16px', fontWeight: 'bold', margin: '16px 0 4px 8px'},
+  SUBHEADER: {fontSize: '14px', fontWeight: 'bold', margin: '10px 0 0 0'},
+  PANEL: {width: '400px', border: '1px solid #cccccc'},
+  HR: ui.Panel(null, ui.Panel.Layout.flow('horizontal'), 
+    {border: '1px solid #E0E0E0', margin: '20px 0px'}),
+  INSTRUCTION: {fontSize: '12px', color: '#999999', margin: '4px 8px'},
+  INFO: {fontSize: '12px', color: '#1976D2', margin: '4px 8px'},
+  ERROR: {fontSize: '13px', color: '#D32F2F', fontWeight: 'bold', margin: '8px'},
+  SUCCESS: {fontSize: '13px', color: '#388E3C', fontWeight: 'bold', margin: '8px'},
+  WARNING: {fontSize: '13px', color: '#F57C00', fontStyle: 'italic', margin: '8px'}
+};
+
+// =================================================================================
+// === 2. DATA SOURCES =============================================================
+// =================================================================================
+
+var forestCarbon = ee.ImageCollection("projects/sat-io/open-datasets/carbon_stocks_ca/fc").first();
+var soilCarbon = ee.ImageCollection("projects/sat-io/open-datasets/carbon_stocks_ca/sc").first();
+
+var palettes = require('users/gena/packages:palettes');
+var fcVis = {palette: palettes.colorbrewer.Greens[7], min: 0, max: 20};
+var scVis = {palette: palettes.colorbrewer.Purples[7], min: 5, max: 30};
+
+// =================================================================================
+// === 3. STATE MANAGEMENT =========================================================
+// =================================================================================
+
+var AppState = {
+  currentAoi: null,
+  currentPoints: null,
+  pointsLayer: null,
+  carbonStats: null,
+  currentCarbonType: null,
+  
+  reset: function() {
+    this.currentAoi = null;
+    this.currentPoints = null;
+    this.carbonStats = null;
+    this.currentCarbonType = null;
+    if (this.pointsLayer) {
+      map.layers().remove(this.pointsLayer);
+      this.pointsLayer = null;
+    }
+  }
+};
+
+// =================================================================================
+// === 4. UTILITY FUNCTIONS ========================================================
+// =================================================================================
+
+var Utils = {
+  
+  validateNumber: function(value, min, max, name) {
+    var num = parseFloat(value);
+    if (isNaN(num) || num < min || num > max) {
+      return {valid: false, message: name + ' must be between ' + min + ' and ' + max};
+    }
+    return {valid: true, value: num};
+  },
+  
+  formatNumber: function(num, decimals) {
+    decimals = decimals !== undefined ? decimals : 2;
+    if (num === null || num === undefined) return 'N/A';
+    return num.toLocaleString('en-US', {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals
+    });
+  },
+  
+  /**
+   * Calculate Z-score using polynomial approximation
+   * z = 2.41 + (-10.9 * α) + (37.7 * α²) - (57.9 * α³)
+   */
+  calculateZScore: function(confidencePercent) {
+    var alpha = 1 - (confidencePercent / 100);
+    return 2.41 + (-10.9 * alpha) + (37.7 * Math.pow(alpha, 2)) - (57.9 * Math.pow(alpha, 3));
+  },
+  
+  /**
+   * Apply Bayesian blending to measured statistics
+   * 
+   * Blends measured values with Canada-wide defaults based on AOI area.
+   * Larger areas trust measured values more; smaller areas shrink toward defaults.
+   * 
+   * Formula:
+   *   w = A / (A + A_ref)
+   *   blended_value = w × measured + (1-w) × default
+   * 
+   * Where A_ref = 200,000 ha (area where weight = 50%)
+   * 
+   * @param {Number} measuredMean - Measured mean from AOI
+   * @param {Number} measuredStdDev - Measured std dev from AOI
+   * @param {Number} areaHa - AOI area in hectares
+   * @param {String} carbonType - 'forest' or 'soil'
+   * @returns {Object} Blended mean and stdDev
+   */
+  applyBayesianBlending: function(measuredMean, measuredStdDev, areaHa, carbonType) {
+    // Get defaults for this carbon type
+    var defaults = CONFIG.DEFAULTS[carbonType];
+    
+    // Calculate area-based weight: w = A / (A + A_ref)
+    var w = areaHa / (areaHa + CONFIG.A_REF);
+    
+    // Blend measured values with defaults
+    var blendedMean = (w * measuredMean) + ((1 - w) * defaults.mean);
+    var blendedStdDev = (w * measuredStdDev) + ((1 - w) * defaults.stdDev);
+    
+    return {
+      mean: blendedMean,
+      stdDev: blendedStdDev,
+      weight: w,
+      measuredMean: measuredMean,
+      measuredStdDev: measuredStdDev,
+      defaultMean: defaults.mean,
+      defaultStdDev: defaults.stdDev
+    };
+  },
+  
+  /**
+   * Calculate sample size using UNFCCC Method I: Sampling Without Replacement
+   * Reference: UNFCCC CDM EB 46, Annex 19, Page 4, Equation 5
+   * 
+   * Now includes Bayesian blending of measured and default statistics.
+   * 
+   * Formula (for single stratum, no costs):
+   * 
+   *         (N × st)²
+   * n = ─────────────────────────
+   *     (N × E / z)² + N × st²
+   * 
+   * Where:
+   *   N = Maximum possible plots = Area / Plot Size (Equation 1)
+   *   st = Blended standard deviation (Bayesian)
+   *   E = Allowable error = Blended Mean × precision (Equation 2)
+   *   z = Z-score for confidence level
+   * 
+   * @param {Number} measuredMean - Measured mean carbon value from AOI
+   * @param {Number} measuredStdDev - Measured standard deviation from AOI
+   * @param {Number} confidence - Confidence level percent (e.g., 95)
+   * @param {Number} marginOfErrorPercent - Target precision as percent (e.g., 10)
+   * @param {Number} areaHa - Area in hectares (A)
+   * @param {Number} plotSizeHa - Plot size in hectares (AP)
+   * @param {String} carbonType - 'forest' or 'soil' for Bayesian blending
+   * @returns {Object} Sample size calculation results
+   */
+  calculateSampleSize: function(measuredMean, measuredStdDev, confidence, marginOfErrorPercent, areaHa, plotSizeHa, carbonType) {
+    if (!measuredMean || measuredMean === 0 || !measuredStdDev || measuredStdDev === 0 || !areaHa || areaHa === 0) {
+      return null;
+    }
+    
+    // -------------------------------------------------------------------------
+    // Step 1: Apply Bayesian blending
+    // Blend measured values with Canada-wide defaults based on AOI area
+    // -------------------------------------------------------------------------
+    var blended = this.applyBayesianBlending(measuredMean, measuredStdDev, areaHa, carbonType);
+    var mean = blended.mean;
+    var stdDev = blended.stdDev;
+    
+    // -------------------------------------------------------------------------
+    // Step 2: Calculate population size (UNFCCC Equation 1)
+    // N = A / AP (maximum possible number of non-overlapping plots)
+    // -------------------------------------------------------------------------
+    var N = areaHa / plotSizeHa;
+    
+    // -------------------------------------------------------------------------
+    // Step 3: Calculate allowable error (UNFCCC Equation 2)
+    // E = Q × p (blended mean × precision)
+    // -------------------------------------------------------------------------
+    var E = mean * (marginOfErrorPercent / 100);
+    
+    // -------------------------------------------------------------------------
+    // Step 4: Get z-score for confidence level
+    // -------------------------------------------------------------------------
+    var z = this.calculateZScore(confidence);
+    
+    // -------------------------------------------------------------------------
+    // Step 5: Calculate sample size using Equation 5
+    // -------------------------------------------------------------------------
+    
+    // Numerator: (N × st)²
+    var numerator = Math.pow(N * stdDev, 2);
+    
+    // Denominator Part 1: (N × E / z)² - the precision term
+    var denomPart1 = Math.pow((N * E) / z, 2);
+    
+    // Denominator Part 2: N × st² - the finite population correction term
+    var denomPart2 = N * Math.pow(stdDev, 2);
+    
+    // Full denominator
+    var denominator = denomPart1 + denomPart2;
+    
+    // Calculate n
+    var n = numerator / denominator;
+    
+    // -------------------------------------------------------------------------
+    // Additional statistics for reporting
+    // -------------------------------------------------------------------------
+    var cv = (stdDev / mean) * 100;
+    var samplingFraction = (n / N) * 100;
+    
+    return {
+      sampleSize: Math.ceil(n),
+      zScore: z,
+      marginOfErrorAbsolute: E,
+      cv: cv,
+      populationN: Math.floor(N),
+      plotSizeM2: plotSizeHa * 10000,
+      samplingFraction: samplingFraction,
+      // Blending info
+      blendWeight: blended.weight,
+      blendedMean: mean,
+      blendedStdDev: stdDev,
+      measuredMean: blended.measuredMean,
+      measuredStdDev: blended.measuredStdDev
+    };
+  },
+  
+  /**
+   * Calculate carbon statistics for a region
+   * Returns stats and area for sample size calculation
+   */
+  calculateCarbonStats: function(region, carbonType) {
+    var carbonImage = carbonType === 'forest' ? forestCarbon : soilCarbon;
+    
+    var stats = carbonImage.reduceRegion({
+      reducer: ee.Reducer.mean()
+        .combine(ee.Reducer.stdDev(), '', true)
+        .combine(ee.Reducer.count(), '', true)
+        .combine(ee.Reducer.minMax(), '', true),
+      geometry: region,
+      scale: CONFIG.ANALYSIS_SCALE,
+      maxPixels: CONFIG.MAX_PIXELS
+    });
+    
+    // Also get area for population calculation
+    var areaM2 = region.area({maxError: CONFIG.MAX_ERROR});
+    
+    return ee.Dictionary(stats).set('area_m2', areaM2);
+  },
+  
+  /**
+   * Get valid sampling mask for carbon type
+   * Returns a binary mask where 1 = valid carbon data exists
+   * 
+   * @param {String} carbonType - 'forest' or 'soil'
+   * @returns {ee.Image} Binary mask (1 = valid, 0 = no data)
+   */
+  getValidAreaMask: function(carbonType) {
+    var carbonImage = carbonType === 'forest' ? forestCarbon : soilCarbon;
+    // Create mask where carbon data exists (not null/masked)
+    return carbonImage.mask().rename('valid_area');
+  },
+  
+  /**
+   * Generate random points only within valid carbon areas
+   * 
+   * @param {ee.Geometry} region - AOI geometry
+   * @param {Number} numPoints - Number of points to generate
+   * @param {String} carbonType - 'forest' or 'soil'
+   * @param {Number} seed - Random seed for reproducibility
+   * @returns {ee.FeatureCollection} Random points within valid areas
+   */
+  generateMaskedRandomPoints: function(region, numPoints, carbonType, seed) {
+    var carbonImage = carbonType === 'forest' ? forestCarbon : soilCarbon;
+    
+    // Create valid area mask
+    var validMask = carbonImage.mask();
+    
+    // Get the valid area geometry by vectorizing the mask
+    // Use stratifiedSample on the mask to get random points only in valid areas
+    var points = validMask.selfMask().randomPoints({
+      numPoints: numPoints,
+      classBand: 'b1',  // The mask band
+      region: region,
+      scale: CONFIG.ANALYSIS_SCALE,
+      seed: seed,
+      geometries: true
+    });
+    
+    return points;
+  }
+};
+
+// =================================================================================
+// === 5. USER INTERFACE ===========================================================
+// =================================================================================
+
+ui.root.clear();
+var map = ui.Map();
+var panel = ui.Panel({style: STYLES.PANEL});
+var splitPanel = ui.SplitPanel(panel, map, 'horizontal', false);
+ui.root.add(splitPanel);
+map.setCenter(-95, 55, 4);
+
+// --- Header ---
+panel.add(ui.Label('NxC - Sampling Toolkit', STYLES.TITLE));
+panel.add(ui.Label('Random Sampling Strategy', STYLES.SUBTITLE));
+panel.add(ui.Label(
+  'Calculate sample sizes based on carbon variability and generate random sampling points.',
+  STYLES.PARAGRAPH
+));
+panel.add(STYLES.HR);
+
+// --- Step 1: Define AOI ---
+panel.add(ui.Label('Step 1: Define Area of Interest', STYLES.HEADER));
+
+var aoiSelection = ui.Select({
+  items: ['Draw a polygon', 'Use a GEE Asset'],
+  value: 'Draw a polygon',
+  style: {stretch: 'horizontal', margin: '0 8px'},
+  onChange: function(value) {
+    assetPanel.style().set('shown', value === 'Use a GEE Asset');
+    map.drawingTools().setShown(value === 'Draw a polygon');
+  }
+});
+
+var assetIdBox = ui.Textbox({
+  placeholder: 'e.g., users/your_name/your_asset',
+  style: {stretch: 'horizontal', margin: '0 8px'}
+});
+
+var assetPanel = ui.Panel([
+  ui.Label('Enter GEE Asset Path:', STYLES.INSTRUCTION),
+  assetIdBox
+], null, {shown: false});
+
+panel.add(aoiSelection);
+panel.add(assetPanel);
+panel.add(ui.Label('► Draw your area of interest on the map', STYLES.INSTRUCTION));
+
+// --- Step 2: Calculate Sample Size ---
+panel.add(ui.Label('Step 2: Calculate Sample Size', STYLES.HEADER));
+
+// Carbon type selection
+var carbonTypeSelect = ui.Select({
+  items: ['Forest Carbon', 'Soil Carbon'],
+  value: 'Forest Carbon',
+  style: {stretch: 'horizontal', margin: '0 8px'}
+});
+
+panel.add(ui.Label('Calculate based on:', {margin: '8px 8px 4px 8px', fontWeight: 'bold'}));
+panel.add(carbonTypeSelect);
+
+// Statistical parameters
+var confidenceBox = ui.Textbox({
+  placeholder: '70-99',
+  value: CONFIG.DEFAULT_CONFIDENCE.toString(),
+  style: {width: '80px', margin: '0 8px'}
+});
+
+var marginOfErrorBox = ui.Textbox({
+  placeholder: '1-50',
+  value: CONFIG.DEFAULT_MARGIN_OF_ERROR.toString(),
+  style: {width: '80px', margin: '0 8px'}
+});
+
+panel.add(ui.Panel([
+  ui.Label('Confidence Level (%):', {width: '140px'}),
+  confidenceBox
+], ui.Panel.Layout.flow('horizontal'), {margin: '4px 8px'}));
+
+panel.add(ui.Panel([
+  ui.Label('Margin of Error (%):', {width: '140px'}),
+  marginOfErrorBox
+], ui.Panel.Layout.flow('horizontal'), {margin: '4px 8px'}));
+
+panel.add(ui.Label(
+  '► Higher confidence and lower margin of error require more samples',
+  STYLES.INSTRUCTION
+));
+
+var calculateButton = ui.Button({
+  label: '📊 Calculate Sample Size',
+  style: {stretch: 'horizontal', margin: '8px'},
+  onClick: calculateSampleSize
+});
+panel.add(calculateButton);
+
+var resultsPanel = ui.Panel({style: {margin: '0 8px'}});
+panel.add(resultsPanel);
+
+// --- Step 3: Generate Points ---
+panel.add(ui.Label('Step 3: Generate & Export Points', STYLES.HEADER));
+
+var numPointsBox = ui.Textbox({
+  placeholder: 'Number of points...',
+  style: {stretch: 'horizontal', margin: '0 8px'}
+});
+
+panel.add(ui.Label('Number of sampling points:', {margin: '8px 8px 4px 8px', fontWeight: 'bold'}));
+panel.add(numPointsBox);
+
+var generateButton = ui.Button({
+  label: 'Generate Random Points',
+  style: {stretch: 'horizontal', margin: '8px'},
+  onClick: generatePoints
+});
+panel.add(generateButton);
+
+// Export section
+panel.add(ui.Label('Export Format:', {margin: '8px 8px 4px 8px', fontWeight: 'bold'}));
+var formatSelect = ui.Select({
+  items: ['CSV', 'GeoJSON', 'KML', 'SHP'],
+  value: 'CSV',
+  style: {stretch: 'horizontal', margin: '0 8px'}
+});
+panel.add(formatSelect);
+
+var exportButton = ui.Button({
+  label: '⬇️ Export Points',
+  style: {stretch: 'horizontal', margin: '8px'},
+  disabled: true
+});
+panel.add(exportButton);
+
+var downloadLinksPanel = ui.Panel({style: {margin: '0 8px'}});
+panel.add(downloadLinksPanel);
+
+var clearButton = ui.Button({
+  label: 'Clear All & Start Over',
+  style: {stretch: 'horizontal', margin: '8px'},
+  onClick: clearAll
+});
+panel.add(clearButton);
+
+// =================================================================================
+// === 6. CORE FUNCTIONS ===========================================================
+// =================================================================================
+
+/**
+ * Get AOI from drawing tools or asset
+ */
+function getAoi() {
+  var method = aoiSelection.getValue();
+  
+  if (method === 'Draw a polygon') {
+    var layers = map.drawingTools().layers();
+    if (layers.length() === 0 || layers.get(0).geometries().length() === 0) {
+      return null;
+    }
+    return layers.get(0).toGeometry();
+  } else {
+    var assetId = assetIdBox.getValue();
+    if (!assetId || assetId.trim() === '') {
+      return null;
+    }
+    try {
+      return ee.FeatureCollection(assetId.trim()).geometry();
+    } catch (e) {
+      return null;
+    }
+  }
+}
+
+/**
+ * Calculate and display sample size
+ */
+function calculateSampleSize() {
+  resultsPanel.clear();
+  map.layers().reset();
+  
+  // Get AOI
+  AppState.currentAoi = getAoi();
+  if (!AppState.currentAoi) {
+    resultsPanel.add(ui.Label('⚠️ Please define an area of interest first!', STYLES.ERROR));
+    return;
+  }
+  
+  // Validate inputs
+  var confVal = Utils.validateNumber(confidenceBox.getValue(), 70, 99.9, 'Confidence level');
+  if (!confVal.valid) {
+    resultsPanel.add(ui.Label(confVal.message, STYLES.ERROR));
+    return;
+  }
+  
+  var moeVal = Utils.validateNumber(marginOfErrorBox.getValue(), 1, 50, 'Margin of error');
+  if (!moeVal.valid) {
+    resultsPanel.add(ui.Label(moeVal.message, STYLES.ERROR));
+    return;
+  }
+  
+  resultsPanel.add(ui.Label('Calculating statistics...', {
+    color: '#666', fontStyle: 'italic', margin: '8px'
+  }));
+  
+  // Add AOI to map
+  map.centerObject(AppState.currentAoi, 10);
+  map.addLayer(AppState.currentAoi, {color: 'E53935'}, 'Area of Interest');
+  map.addLayer(forestCarbon.clip(AppState.currentAoi), fcVis, 'Forest Carbon', false);
+  map.addLayer(soilCarbon.clip(AppState.currentAoi), scVis, 'Soil Carbon', false);
+  
+  // Get carbon type and store in AppState for point generation
+  var carbonType = carbonTypeSelect.getValue() === 'Forest Carbon' ? 'forest' : 'soil';
+  AppState.currentCarbonType = carbonType;
+  
+  // Calculate statistics
+  Utils.calculateCarbonStats(AppState.currentAoi, carbonType).evaluate(function(stats, error) {
+    resultsPanel.clear();
+    
+    if (error) {
+      resultsPanel.add(ui.Label('⚠️ Error: ' + error, STYLES.ERROR));
+      return;
+    }
+    
+    var mean = stats.b1_mean;
+    var stdDev = stats.b1_stdDev;
+    var count = stats.b1_count;
+    var minVal = stats.b1_min;
+    var maxVal = stats.b1_max;
+    
+    if (!mean || !stdDev) {
+      resultsPanel.add(ui.Label('⚠️ No ' + carbonType + ' carbon data in this AOI.', STYLES.WARNING));
+      return;
+    }
+    
+    AppState.carbonStats = stats;
+    
+    // Get area in hectares
+    var areaHa = stats.area_m2 / 10000;
+    
+    // Get plot size based on carbon type (UNFCCC methodology)
+    var plotSizeHa = carbonType === 'forest' ? 
+      CONFIG.FOREST_PLOT_SIZE_HA : CONFIG.SOIL_PLOT_SIZE_HA;
+    
+    // Display measured statistics (what user sees)
+    resultsPanel.add(ui.Label(carbonTypeSelect.getValue() + ' Statistics', STYLES.SUBHEADER));
+    resultsPanel.add(ui.Label('Area: ' + Utils.formatNumber(areaHa, 1) + ' ha', {margin: '4px 8px'}));
+    resultsPanel.add(ui.Label('Mean: ' + Utils.formatNumber(mean, 2) + ' t/ha', {margin: '4px 8px'}));
+    resultsPanel.add(ui.Label('Std Dev: ' + Utils.formatNumber(stdDev, 2) + ' t/ha', {margin: '4px 8px'}));
+    resultsPanel.add(ui.Label('CV: ' + Utils.formatNumber((stdDev/mean)*100, 1) + '%', {margin: '4px 8px'}));
+    resultsPanel.add(ui.Label('Range: ' + Utils.formatNumber(minVal, 2) + ' - ' + Utils.formatNumber(maxVal, 2) + ' t/ha', {margin: '4px 8px'}));
+    
+    // Calculate sample size with Bayesian blending
+    var result = Utils.calculateSampleSize(mean, stdDev, confVal.value, moeVal.value, areaHa, plotSizeHa, carbonType);
+    
+    if (!result) {
+      resultsPanel.add(ui.Label('⚠️ Unable to calculate sample size.', STYLES.WARNING));
+      return;
+    }
+    
+    resultsPanel.add(ui.Label(''));
+    resultsPanel.add(ui.Label('Recommended Sample Size', STYLES.SUBHEADER));
+    
+    var samplePanel = ui.Panel([
+      ui.Label(result.sampleSize.toString() + ' samples', {
+        fontSize: '24px', fontWeight: 'bold', color: '#005931', margin: '4px 0'
+      }),
+      ui.Label(confVal.value + '% confidence, ±' + moeVal.value + '% error', {
+        fontSize: '11px', color: '#666'
+      }),
+      ui.Label('Margin of error: ±' + Utils.formatNumber(result.marginOfErrorAbsolute, 2) + ' t/ha', {
+        fontSize: '11px', color: '#666'
+      }),
+      ui.Label('Population (N): ' + Utils.formatNumber(result.populationN, 0) + ' | Sampling fraction: ' + Utils.formatNumber(result.samplingFraction, 2) + '%', {
+        fontSize: '11px', color: '#666'
+      })
+    ], null, {
+      border: '2px solid #005931',
+      padding: '12px',
+      margin: '8px 0'
+    });
+    resultsPanel.add(samplePanel);
+    
+    // Note about UNFCCC methodology
+    resultsPanel.add(ui.Label(
+      '► UNFCCC Method I (Eq. 5) with Bayesian blending',
+      STYLES.INFO
+    ));
+    
+    // Apply button
+    var applyButton = ui.Button({
+      label: 'Apply to Points Field',
+      style: {margin: '4px 0'},
+      onClick: function() {
+        numPointsBox.setValue(result.sampleSize.toString());
+        resultsPanel.add(ui.Label('✓ Applied ' + result.sampleSize + ' to points field', STYLES.SUCCESS));
+      }
+    });
+    resultsPanel.add(applyButton);
+    
+    // Print to console
+    print('═══════════════════════════════════════════════════════');
+    print('📊 Sample Size - UNFCCC Method I (Equation 5)');
+    print('═══════════════════════════════════════════════════════');
+    print('Formula: n = (N×st)² / [(N×E/z)² + N×st²]');
+    print('');
+    print('Carbon Type:', carbonType);
+    print('Area:', areaHa.toFixed(1), 'ha');
+    print('Plot Size:', (plotSizeHa * 10000).toFixed(0), 'm²');
+    print('Population (N):', result.populationN);
+    print('');
+    print('─── Bayesian Blending ───');
+    print('Area weight (w):', (result.blendWeight * 100).toFixed(1) + '%');
+    print('Measured Mean:', result.measuredMean.toFixed(2), '→ Blended:', result.blendedMean.toFixed(2), 't/ha');
+    print('Measured StdDev:', result.measuredStdDev.toFixed(2), '→ Blended:', result.blendedStdDev.toFixed(2), 't/ha');
+    print('');
+    print('─── Sample Size Calculation ───');
+    print('Confidence:', confVal.value + '%');
+    print('Precision:', moeVal.value + '%');
+    print('Blended CV:', result.cv.toFixed(1) + '%');
+    print('Allowable Error (E):', result.marginOfErrorAbsolute.toFixed(2), 't/ha');
+    print('Z-score:', result.zScore.toFixed(4));
+    print('');
+    print('Sampling fraction:', result.samplingFraction.toFixed(2) + '%');
+    print('Recommended n:', result.sampleSize);
+  });
+}
+
+/**
+ * Generate random sampling points
+ */
+function generatePoints() {
+  // Remove existing points
+  if (AppState.pointsLayer) {
+    map.layers().remove(AppState.pointsLayer);
+    AppState.pointsLayer = null;
+  }
+  
+  if (!AppState.currentAoi) {
+    resultsPanel.add(ui.Label('⚠️ Please calculate sample size first!', STYLES.ERROR));
+    return;
+  }
+  
+  if (!AppState.currentCarbonType) {
+    resultsPanel.add(ui.Label('⚠️ Please calculate sample size first to set carbon type!', STYLES.ERROR));
+    return;
+  }
+  
+  var numVal = Utils.validateNumber(numPointsBox.getValue(), 1, 10000, 'Number of points');
+  if (!numVal.valid) {
+    resultsPanel.add(ui.Label(numVal.message, STYLES.ERROR));
+    return;
+  }
+  
+  var numPoints = numVal.value;
+  var carbonType = AppState.currentCarbonType;
+  
+  // Show loading message
+  resultsPanel.add(ui.Label('Generating points in ' + carbonType + ' areas only...', {
+    color: '#666', fontStyle: 'italic', margin: '4px 8px'
+  }));
+  
+  // -------------------------------------------------------------------------
+  // Generate random points ONLY within valid carbon areas
+  // Uses the carbon raster as a mask to ensure points fall in forested/soil areas
+  // -------------------------------------------------------------------------
+  
+  var carbonImage = carbonType === 'forest' ? forestCarbon : soilCarbon;
+  
+  // Create a mask where carbon data exists (valid areas only)
+  var validMask = carbonImage.mask().selfMask();
+  var validMask = validMask.toInt()
+  
+  // Use stratifiedSample to generate points only where mask = 1
+  // This ensures points only fall in areas with carbon data
+  var points = validMask.stratifiedSample({
+    numPoints: numPoints,
+    classBand: 'b1',
+    region: AppState.currentAoi,
+    scale: CONFIG.ANALYSIS_SCALE,
+    seed: CONFIG.RANDOM_SEED,
+    geometries: true
+  });
+  
+  // Add IDs and coordinates
+  AppState.currentPoints = points.map(function(pt) {
+    var coords = pt.geometry().coordinates();
+    return pt.set({
+      'point_id': ee.String('PT_').cat(ee.Number(pt.get('system:index')).format('%04d')),
+      'carbon_type': carbonType,
+      'sampling_type': 'random_masked',
+      'lon': coords.get(0),
+      'lat': coords.get(1)
+    });
+  });
+  
+  // Get actual count (may differ slightly from requested due to masking)
+  AppState.currentPoints.size().evaluate(function(actualCount, error) {
+    if (error) {
+      resultsPanel.add(ui.Label('⚠️ Error generating points: ' + error, STYLES.ERROR));
+      return;
+    }
+    
+    // Add to map
+    AppState.pointsLayer = ui.Map.Layer(
+      AppState.currentPoints,
+      {color: carbonType === 'forest' ? '228B22' : '8B4513'},
+      carbonType.charAt(0).toUpperCase() + carbonType.slice(1) + ' Sampling Points (' + actualCount + ')'
+    );
+    map.layers().add(AppState.pointsLayer);
+    
+    // Enable export
+    exportButton.setDisabled(false);
+    
+    var msg = '✓ Generated ' + actualCount + ' points in ' + carbonType + ' areas';
+    if (actualCount < numPoints) {
+      msg += ' (requested ' + numPoints + ')';
+    }
+    resultsPanel.add(ui.Label(msg, STYLES.SUCCESS));
+    print(msg);
+  });
+}
+
+/**
+ * Export points
+ */
+exportButton.onClick(function() {
+  if (!AppState.currentPoints) {
+    alert('Please generate sampling points first.');
+    return;
+  }
+  
+  downloadLinksPanel.clear();
+  var format = formatSelect.getValue();
+  
+  var exportData = AppState.currentPoints.map(function(f) {
+    return f.set({
+      'export_format': format,
+      'export_date': ee.Date(Date.now()).format('YYYY-MM-dd')
+    });
+  });
+  
+  var downloadUrl = exportData.getDownloadURL({
+    format: format === 'SHP' ? 'SHP' : format,
+    filename: 'random_sampling_points_' + new Date().getTime()
+  });
+  
+  var link = ui.Label({
+    value: '⬇️ Download Points (' + format + ')',
+    style: {
+      color: '#1976D2',
+      textDecoration: 'underline',
+      margin: '8px',
+      fontSize: '13px',
+      fontWeight: 'bold'
+    },
+    targetUrl: downloadUrl
+  });
+  
+  downloadLinksPanel.add(link);
+  print('✓ Export link generated');
+});
+
+/**
+ * Clear all and reset
+ */
+function clearAll() {
+  AppState.reset();
+  map.layers().reset();
+  map.drawingTools().clear();
+  map.drawingTools().setShown(true);
+  resultsPanel.clear();
+  downloadLinksPanel.clear();
+  numPointsBox.setValue('');
+  exportButton.setDisabled(true);
+  print('✓ Tool reset');
+}
+
+// =================================================================================
+// === 7. INITIALIZE ===============================================================
+// =================================================================================
+
+var drawingTools = map.drawingTools();
+drawingTools.setShown(true);
+drawingTools.setDrawModes(['polygon', 'rectangle']);
+drawingTools.setLinked(false);
+drawingTools.setShape('polygon');
+
+map.setControlVisibility({
+  all: false,
+  layerList: true,
+  zoomControl: true,
+  scaleControl: true,
+  mapTypeControl: true,
+  fullscreenControl: false,
+  drawingToolsControl: true
+});
+
+print('═══════════════════════════════════════════════════════');
+print('🌲 Nature Meets Carbon - Random Sampling Tool v3.3');
+print('═══════════════════════════════════════════════════════');
+print('');
+print('Sample Size: UNFCCC Method I (Eq. 5) + Bayesian Blending');
+print('  n = (N×st)² / [(N×E/z)² + N×st²]');
+print('');
+print('Features:');
+print('  • Bayesian blending of measured & default statistics');
+print('  • Masked sampling (forest-only or soil-only areas)');
+print('  • A_ref = 200,000 ha (50% weight point)');
+print('  • Plot size: Forest=400m², Soil=100m²');
+print('');
+print('Ready to use!');
