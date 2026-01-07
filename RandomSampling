@@ -160,6 +160,7 @@ var Utils = {
     };
   },
   
+  
   /**
    * Calculate sample size using UNFCCC Method I: Sampling Without Replacement
    * Reference: UNFCCC CDM EB 46, Annex 19, Page 4, Equation 5
@@ -241,6 +242,7 @@ var Utils = {
     // -------------------------------------------------------------------------
     var cv = (stdDev / mean) * 100;
     var samplingFraction = (n / N) * 100;
+    
     
     return {
       sampleSize: Math.ceil(n),
@@ -398,6 +400,26 @@ var marginOfErrorBox = ui.Textbox({
   style: {width: '80px', margin: '0 8px'}
 });
 
+// [NEW] CV Override controls
+var cvSlider = ui.Slider({
+  min: 1, 
+  max: 200, 
+  value: 50, 
+  step: 1, 
+  style: {stretch: 'horizontal', margin: '0 8px'},
+  disabled: true // Disabled by default until checkbox is checked
+});
+
+var cvOverrideCheck = ui.Checkbox({
+  label: 'Override calculated CV (%)', 
+  value: false,
+  style: {margin: '8px 8px 0 8px', fontWeight: 'bold'},
+  onChange: function(checked) {
+    cvSlider.setDisabled(!checked);
+  }
+});
+
+
 panel.add(ui.Panel([
   ui.Label('Confidence Level (%):', {width: '140px'}),
   confidenceBox
@@ -412,6 +434,10 @@ panel.add(ui.Label(
   '► Higher confidence and lower margin of error require more samples',
   STYLES.INSTRUCTION
 ));
+
+// [NEW] Add CV controls to panel
+panel.add(cvOverrideCheck);
+panel.add(cvSlider);
 
 var calculateButton = ui.Button({
   label: '📊 Calculate Sample Size',
@@ -574,6 +600,33 @@ function calculateSampleSize() {
     resultsPanel.add(ui.Label('CV: ' + Utils.formatNumber((stdDev/mean)*100, 1) + '%', {margin: '4px 8px'}));
     resultsPanel.add(ui.Label('Range: ' + Utils.formatNumber(minVal, 2) + ' - ' + Utils.formatNumber(maxVal, 2) + ' t/ha', {margin: '4px 8px'}));
     
+    // =========================================================
+    // [PASTE NEW CODE BELOW THIS LINE]
+    // =========================================================
+
+    // [NEW] Handle CV Override
+    // Calculate the actual observed CV from the map data
+    var observedCv = (stdDev / mean) * 100;
+    
+    // Check if user wants to override
+    if (cvOverrideCheck.getValue()) {
+      var manualCv = cvSlider.getValue();
+      
+      // Recalculate the Standard Deviation based on the Manual CV
+      // Formula: StdDev = Mean * (CV / 100)
+      stdDev = mean * (manualCv / 100);
+      
+      resultsPanel.add(ui.Label('⚠️ Using Manual CV: ' + manualCv + '%', STYLES.WARNING));
+    } else {
+      // If not overriding, update the slider to show the actual calculated CV
+      // This helps the user see what the map says before they decide to change it
+      cvSlider.setValue(observedCv);
+    }
+
+    // =========================================================
+    // [PASTE NEW CODE ABOVE THIS LINE]
+    // =================
+    
     // Calculate sample size with Bayesian blending
     var result = Utils.calculateSampleSize(mean, stdDev, confVal.value, moeVal.value, areaHa, plotSizeHa, carbonType);
     
@@ -604,12 +657,6 @@ function calculateSampleSize() {
       margin: '8px 0'
     });
     resultsPanel.add(samplePanel);
-    
-    // Note about UNFCCC methodology
-    resultsPanel.add(ui.Label(
-      '► UNFCCC Method I (Eq. 5) with Bayesian blending',
-      STYLES.INFO
-    ));
     
     // Apply button
     var applyButton = ui.Button({
